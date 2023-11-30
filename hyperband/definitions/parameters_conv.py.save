@@ -1,0 +1,211 @@
+from hyperband.definitions.common_defs import *
+from hyperopt import hp
+from sklearn.metrics import roc_auc_score as AUC, log_loss, accuracy_score as accuracy
+import torch as th
+from torch.utils import data
+
+from data_loader import data_manager as dm
+from model import models as m
+
+"function (and parameter space) definitions for hyperband"
+"n-class classification with torch"
+
+max_layers_conv = 5
+max_layers_fc = 3
+
+space = {
+    'n_conv_layers': hp.quniform('l', 1, max_layers_conv, 1),
+    'n_fc_layers': hp.quniform('l', 1, max_layers_fc, 1),
+    'activation': hp.choice('a', ('relu', 'sigmoid', 'tanh', 'elu', 'leakyrelu')),
+    'init': hp.choice('i', ('standard', 'xavier_uniform',
+                            'xavier_normal', 'kaiming_uniform', 'kaiming_normal')),
+    'batch_size': hp.choice('bs', (4, 8)),
+    'optimizer': hp.choice('o', ('RMSprop', 'Rprop', 'SGD', 'Adam')),
+    'transformation_type': hp.choice('pt', (1, 2, 3, 4)),
+    # 0 - none, 1 - only noise, 2 - only transformation, 3 - first noise then transform, 4 - first transform then noise
+    'noise_alpha': hp.uniform('na', 0.001, 0.01),  # noise - mean value between -alpha and alpha
+    'noise_var': hp.uniform('nv', 0.1, 0.2),  # noise - variance from sigma1 to sigma2
+    'transformation_gridsize': hp.quniform('tg', 8, 12, 1)  # transformation - grid size
+}
+
+# for each hidden layer, we choose size, activation and extras individually
+for i in range(1, max_layers_conv + 1):
+    space['conv_layer_{}_channels_out'.format(i)] = hp.quniform('ls{}'.format(i), 2, 20, 1)
+    space['conv_layer_{}_kernel_size'.format(i)] = hp.quniform('ls{}'.format(i), 2, 200, 1)
+    space['conv_layer_{}_extras'.format(i)] = hp.choice('e{}'.format(i), (
+        # {'name': 'batchnorm'},
+        {'name': None}))
+
+for i in range(1, max_layers_fc + 1):
+    space['fc_layer_{}_channels_out'.format(i)] = hp.quniform('ls{}'.format(i), 2, 100, 1)
+    space['fc_layer_{}_extras'.format(i)] = hp.choice('e{}'.format(i), (
+        {'name': 'dropout', 'rate': hp.uniform('d{}'.format(i), 0.1, 0.5)},
+        # {'name': 'batchnorm'},
+        {'name': None}))
+
+
+def get_params():
+    params = sample(space)
+    return handle_integers(params)
+
+
+#
+
+# print conv layers config in readable way
+def print_layers(params):
+    for i in range(1, params['n_conv_layers'] + 1):
+        print(" conv layer {} | size: {:>3}| extras: {}".format(i,
+                                                                params[
+                                                                    'conv_layer_{}_channels_out'.format(
+                                                                        i)],
+                                                                params[
+                                                                    'conv_layer_{}_extras'.format(
+                                                                        i)][
+                                                                    'name']))
+        if params['conv_layer_{}_extras'.format(i)]['name'] == 'dropout':
+            print("- rate: {:.1%}".format(params['conv_layer_{}_extras'.format(i)]['rate']))
+        print('')
+
+
+# print fc layers config in readable way
+def print_layers(params):
+    for i in range(1, params['n_fc_layers'] + 1):
+        print(" fully connected layer {} | size: {:>3} | extras: {}".format(i,
+                                                                            params[
+                                                                                'fc_layer_{}_channels_out'.format(
+                                                                                    i)],
+                                                                            params[
+                                                                                'fc_layer_{}_extras'.format(
+                                                                                    i)][
+                                                                                'name']))
+        if params['fc_layer_{}_extras'.format(i)]['name'] == 'dropout':
+            print("- rate: {:.1%}".format(params['fc_layer_{}_extras'.format(i)]['rate']))
+        print('')
+
+
+def print_params(params):
+    pprint({k: v for k, v in params.items() if not k.startswith('layer_')})
+    print_layers(params)
+    print('')
+
+
+def try_params(n_iterations, params, args_fixed):
+    n_epochs = n_iterations*5  # one iteration equals 5 epochs
+    print("epochs:", n_epochs)
+    print_params(params)
+
+    transform_parameters = [params['transformation_type'], params['noise_alpha'],
+                            params['noise_var'], params['noise_var'], params['transformation_gridsize']]
+
+    # create data manager
+    data_manager = dm.DataManager_Time(path=args_fixed.path, csvpath=args_fixed.traincsv_path,
+                                       TimeRange=args_fixed.timerange,
+                                       SampleRate=args_fixed.samplerate, FrequencyRange=args_fixed.frequencyrange,
+                                       classes=args_fixed.classes, _train=1, transformParameter=transform_parameters,
+                                       args=None)
+
+    # Parameters
+    carlo_params = {'batch_size': params['batch_size'],
+                    'shuffle': True,
+                    'num_workers': 4,  # args.nb_workers,
+                    'pin_memory': True}
+
+    training_generator = data.DataLoader(data_manager, **carlo_params)
+
+    channels_out_conv = [params['conv_layer_{}_channels_out'.format(i)] for i in range(1, params['n_conv_layers'] + 1)]
+    neurons_out_fc = [params['fc_layer_{}_channels_out'.format(i)] for i in range(1, params['n_fc_layers'] + 1)]
+    kernel_sizes = [params['conv_layer_{}_kernel_size'.format(i)] for i in range(1, params['n_conv_layers'] + 1)]
+    activations = params['activation']
+    conv_w_initialization = params['init']
+    fc_layers_extras = [params['fc_layer_{}_extras'.format(i)] for i in range(1, params['n_fc_layers'] + 1)]
+    dropout_rates = [None for _ in channels_out_conv]
+    for i in range(1, params['n_fc_layers'] + 1):
+        if params['fc_layer_{}_extras'.format(i)]['name'] == 'dropout':
+            dropout_rates.append(params['fc_layer_{}_extras'.format(i)]['rate'])
+        else:
+            dropout_rates.append(None)
+
+    model = m.ParametricConvFCModel(data_manager.sequence_length(), num_classes=len(args_fixed.classes),
+                                    channels_out_conv=channels_out_conv, neurons_out_fc=neurons_out_fc, activations=activations,
+                                    kernel_sizes=kernel_sizes, conv_w_initialization=conv_w_initialization,
+                                    dropout_rates=dropout_rates)
+    print(model)
+
+    optimizer = None
+    if params['optimizer'] == 'RMSprop':
+        optimizer = th.optim.RMSprop(model.parameters(), lr=args_fixed.lr)
+    elif params['optimizer'] == 'Adam':
+        optimizer = th.optim.Adam(model.parameters(), lr=args_fixed.lr, amsgrad=args_fixed.amsgrad)
+    elif params['optimizer'] == 'Rprop':
+        optimizer = th.optim.Rprop(model.parameters(), lr=args_fixed.lr)
+    elif params['optimizer'] == 'SGD':
+        optimizer = th.optim.SGD(model.parameters(), lr=args_fixed.lr)
+
+    # loss function
+    loss = th.nn.CrossEntropyLoss()
+
+    # TRAINING
+
+    device = th.device("cuda:0" if th.cuda.is_available() else "cpu")
+    print(device)
+    model.to(device)
+
+    epoch_start = 0
+    training_counter = 0
+
+    for epoch in range(epoch_start, int(n_epochs)):
+        model = model.train()
+
+        for spec, target_label in training_generator:
+            training_counter = training_counter + 1
+            optimizer.zero_grad()
+            model.zero_grad()
+            spec = spec.unsqueeze(1).to(device)
+            target_label = target_label.to(device)
+            net_output = model(spec)
+            loss_value = loss(net_output, target_label)
+            loss_value.backward()
+            if training_counter % 100 == 1:  # print every 100 mini-batches
+                print("loss function at iteration {} : {}".format(training_counter, loss_value.item()))
+            optimizer.step()
+
+    # VALIDATION
+
+    correct = 0
+    total = 0
+
+    with th.no_grad():
+        model = model.eval()
+        data_manager_test = dm.DataManager_Time(path=args_fixed.path, csvpath=args_fixed.testcsv_path,
+                                                TimeRange=args_fixed.timerange, SampleRate=args_fixed.samplerate,
+                                                FrequencyRange=args_fixed.frequencyrange, classes=args_fixed.classes,
+                                                transformParameter=transform_parameters, _train=0,
+                                                args=None)
+
+        batch_size_eval = 4
+        carlo_params = {'batch_size': batch_size_eval,
+                        'shuffle': True,
+                        'num_workers': 4,  # args.nb_workers,
+                        'pin_memory': True}
+        training_generator_test = data.DataLoader(data_manager_test, **carlo_params)
+
+        for spec, target_label in training_generator_test:
+            inputs = spec.unsqueeze(1).to(device)
+            labels = target_label.to(device)
+            output = model(inputs)
+            _, predicted = th.max(output.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+#    print("**********************")
+#    print(output)
+#    print(labels)
+#    print(predicted)
+#    ll = log_loss(labels.cpu(), output.cpu())
+#    ll = 1 #th.nn.CrossEntropyLoss(labels.cpu(), output.cpu())
+    acc = correct / total
+    print('test accuracy: {}'.format(acc))
+
+    ret
+
+#    return {'loss': ll, 'acc': acc}
